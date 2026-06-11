@@ -1,0 +1,661 @@
+openapi: 3.1.0
+info:
+  title: FinPay API
+  version: "2.1"
+  description: |
+    Indian payments API for accepting payments, disbursing payouts, and managing settlements.
+    Supports UPI, cards, net banking, wallets, and NEFT/IMPS/RTGS.
+    
+    **All monetary amounts are in paise (INR × 100). Never use floats.**
+    
+    **Regulatory scope:** RBI PA Guidelines 2020 · PCI-DSS 4.0 · DPDP Act 2023
+  contact:
+    name: FinPay Developer Experience
+    url: https://docs.finpay.in
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://api.sandbox.finpay.in/v2
+    description: Sandbox (test) — no real money
+  - url: https://api.finpay.in/v2
+    description: Production (live) — real transactions
+
+security:
+  - ApiKeyAuth: []
+  - BearerAuth: []
+
+tags:
+  - name: Payments
+    description: Create, capture, refund, and query payment orders
+  - name: Payouts
+    description: Disburse funds to bank accounts and UPI VPAs
+  - name: Webhooks
+    description: Manage webhook endpoints and retrieve dead-letter events
+  - name: Accounts
+    description: Account balance and settlement information
+  - name: Fraud
+    description: Fraud reporting (RBI compliance)
+
+paths:
+
+  # ─── PAYMENTS ───────────────────────────────────────────────────────────────
+
+  /payments/orders:
+    post:
+      tags: [Payments]
+      operationId: createPaymentOrder
+      summary: Create a payment order
+      description: |
+        Creates a new payment intent. Returns an `order_id` and `payment_link`
+        to redirect the customer. Always use an `Idempotency-Key` header.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            example:
+              amount: 49900
+              currency: INR
+              receipt: order_june_001
+              description: "Premium plan — June 2026"
+              customer:
+                email: user@example.com
+                phone: "+919876543210"
+              capture_mode: automatic
+      responses:
+        '201':
+          description: Order created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/AuthError'
+        '429':
+          $ref: '#/components/responses/RateLimitError'
+
+  /payments/orders/{order_id}:
+    get:
+      tags: [Payments]
+      operationId: getPaymentOrder
+      summary: Retrieve a payment order
+      description: Returns the current state and details of a payment order.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Payment order retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /payments/{order_id}/capture:
+    post:
+      tags: [Payments]
+      operationId: capturePayment
+      summary: Capture an authorized payment
+      description: |
+        Captures funds from an authorized payment. Only valid when `capture_mode`
+        was `manual` and payment is in `authorized` state.
+        **Irreversible action** — captured funds will be settled to merchant.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount:
+                  type: integer
+                  description: Paise to capture. Omit to capture full authorized amount.
+                  example: 49900
+      responses:
+        '200':
+          description: Payment captured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '409':
+          description: Invalid state transition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /payments/{order_id}/refunds:
+    post:
+      tags: [Payments]
+      operationId: createRefund
+      summary: Issue a refund
+      description: |
+        Refunds a captured payment to the customer. Partial refunds supported.
+        Multiple partial refunds allowed up to original captured amount.
+        Processing time: UPI T+1, Cards T+5–7 banking days.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, reason]
+              properties:
+                amount:
+                  type: integer
+                  description: Amount in paise to refund
+                  minimum: 100
+                  example: 49900
+                reason:
+                  type: string
+                  enum: [customer_request, duplicate, fraud, other]
+                  example: customer_request
+                notes:
+                  type: string
+                  maxLength: 255
+      responses:
+        '201':
+          description: Refund initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
+  /payments/{order_id}/void:
+    post:
+      tags: [Payments]
+      operationId: voidPayment
+      summary: Void an authorized payment
+      description: |
+        Cancels an authorized payment before capture. 
+        Only valid for payments in `authorized` state.
+        For captured payments, use the refund endpoint instead.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Payment voided
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+
+  # ─── PAYOUTS ────────────────────────────────────────────────────────────────
+
+  /payouts:
+    post:
+      tags: [Payouts]
+      operationId: createPayout
+      summary: Create a payout
+      description: |
+        Disburses funds from merchant's FinPay balance to a bank account or UPI VPA.
+        Recipients above ₹10,000 require KYC verification (penny-drop performed automatically).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePayoutRequest'
+            example:
+              amount: 150000
+              currency: INR
+              mode: imps
+              purpose: vendor_payment
+              recipient:
+                name: Rajan Enterprises
+                account_number: "9876543210"
+                ifsc: HDFC0001234
+      responses:
+        '201':
+          description: Payout queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payout'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+    get:
+      tags: [Payouts]
+      operationId: listPayouts
+      summary: List payouts
+      parameters:
+        - name: from_date
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: to_date
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [queued, processing, processed, failed, reversed]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        '200':
+          description: List of payouts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Payout'
+                  has_more:
+                    type: boolean
+                  total_count:
+                    type: integer
+
+  /payouts/bulk:
+    post:
+      tags: [Payouts]
+      operationId: createBulkPayout
+      summary: Create bulk payouts
+      description: |
+        Submit up to 1,000 payouts in a single batch. Processed asynchronously.
+        Subscribe to `payout.processed` and `payout.failed` webhooks for status updates.
+        **Requires human review of recipient list before submission.**
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [payouts]
+              properties:
+                payouts:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CreatePayoutRequest'
+                  maxItems: 1000
+                batch_reference:
+                  type: string
+                  description: Merchant's internal batch reference
+      responses:
+        '202':
+          description: Batch accepted for processing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batch_id:
+                    type: string
+                  total_count:
+                    type: integer
+                  total_amount:
+                    type: integer
+                    description: Total paise across all payouts
+                  status:
+                    type: string
+                    enum: [accepted]
+
+  # ─── FRAUD REPORTS ──────────────────────────────────────────────────────────
+
+  /fraud-reports:
+    post:
+      tags: [Fraud]
+      operationId: reportFraud
+      summary: Report suspected fraud
+      description: |
+        Reports a suspected fraud event to FinPay's risk team.
+        **Required by RBI PA Guidelines within 24 hours of detection.**
+        Even if a refund has already been issued, the report must still be filed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id, fraud_type, description]
+              properties:
+                order_id:
+                  type: string
+                  example: ord_01HX9ABCDEF
+                fraud_type:
+                  type: string
+                  enum:
+                    - card_not_present
+                    - account_takeover
+                    - friendly_fraud
+                    - identity_theft
+                    - other
+                description:
+                  type: string
+                  minLength: 20
+                  maxLength: 1000
+                reporter_reference:
+                  type: string
+                  description: Merchant's internal case ID
+      responses:
+        '201':
+          description: Fraud report filed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  report_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [received]
+                  created_at:
+                    type: string
+                    format: date-time
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-FinPay-Key
+      description: "Publishable API key. Format: fpk_test_... or fpk_live_..."
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: OAuth 2.0 access token
+
+  parameters:
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^ord_[A-Za-z0-9]+$'
+      description: FinPay order ID (ord_...)
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: UUIDv4 idempotency key. Required for all write operations.
+
+  schemas:
+    CreateOrderRequest:
+      type: object
+      required: [amount, currency, receipt]
+      properties:
+        amount:
+          type: integer
+          description: Amount in paise (INR × 100). Min 100, Max 50000000.
+          minimum: 100
+          maximum: 50000000
+          example: 49900
+        currency:
+          type: string
+          enum: [INR]
+          description: Must be INR. No other currencies supported.
+        receipt:
+          type: string
+          maxLength: 40
+          description: Merchant's internal order reference.
+          example: order_june_001
+        description:
+          type: string
+          maxLength: 255
+        customer:
+          type: object
+          properties:
+            name:
+              type: string
+            email:
+              type: string
+              format: email
+            phone:
+              type: string
+              pattern: '^\+91[0-9]{10}$'
+        capture_mode:
+          type: string
+          enum: [automatic, manual]
+          default: automatic
+        payment_methods:
+          type: array
+          items:
+            type: string
+            enum: [upi, card, netbanking, wallet, neft, imps]
+        metadata:
+          type: object
+          maxProperties: 20
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+          pattern: '^ord_[A-Za-z0-9]+$'
+          example: ord_01HX9ABCDEF
+        status:
+          type: string
+          enum: [created, processing, authorized, captured, settled, failed, refunded, voided]
+        amount:
+          type: integer
+          description: Original order amount in paise
+        amount_captured:
+          type: integer
+        amount_refunded:
+          type: integer
+        currency:
+          type: string
+          example: INR
+        receipt:
+          type: string
+        description:
+          type: string
+        payment_link:
+          type: string
+          format: uri
+        payment_method:
+          type: string
+          enum: [upi, card, netbanking, wallet, neft, imps]
+        customer:
+          type: object
+          properties:
+            name:
+              type: string
+            email:
+              type: string
+            phone:
+              type: string
+        metadata:
+          type: object
+        created_at:
+          type: string
+          format: date-time
+        captured_at:
+          type: string
+          format: date-time
+          nullable: true
+        settled_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    Refund:
+      type: object
+      properties:
+        id:
+          type: string
+          pattern: '^ref_[A-Za-z0-9]+$'
+          example: ref_01HX9REFUND
+        order_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, processing, processed, failed]
+        amount:
+          type: integer
+        reason:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    CreatePayoutRequest:
+      type: object
+      required: [amount, currency, mode, purpose, recipient]
+      properties:
+        amount:
+          type: integer
+          minimum: 100
+          description: Amount in paise
+        currency:
+          type: string
+          enum: [INR]
+        mode:
+          type: string
+          enum: [imps, neft, upi, rtgs]
+          description: |
+            imps: Immediate, 24x7, max ₹2L
+            neft: Batch, RBI hours, no limit
+            upi: Immediate, 24x7, max ₹1L
+            rtgs: Immediate, RBI hours, min ₹2L
+        purpose:
+          type: string
+          enum: [vendor_payment, salary, refund, cashback, other]
+        recipient:
+          type: object
+          properties:
+            name:
+              type: string
+            account_number:
+              type: string
+              description: Required for IMPS/NEFT/RTGS
+            ifsc:
+              type: string
+              pattern: '^[A-Z]{4}0[A-Z0-9]{6}$'
+              description: Required for IMPS/NEFT/RTGS
+            vpa:
+              type: string
+              pattern: '^[a-zA-Z0-9._-]+@[a-zA-Z]{3,}$'
+              description: Required for UPI
+        reference:
+          type: string
+          maxLength: 40
+
+    Payout:
+      type: object
+      properties:
+        id:
+          type: string
+          pattern: '^pyt_[A-Za-z0-9]+$'
+          example: pyt_01HX9XYZABC
+        status:
+          type: string
+          enum: [queued, processing, processed, failed, reversed]
+        amount:
+          type: integer
+        currency:
+          type: string
+        mode:
+          type: string
+        purpose:
+          type: string
+        recipient:
+          type: object
+        utr:
+          type: string
+          description: Unique Transaction Reference (bank-assigned)
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        processed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, retryable, request_id]
+          properties:
+            code:
+              type: string
+              example: payment_failed_insufficient_funds
+            message:
+              type: string
+            param:
+              type: string
+              nullable: true
+            doc_url:
+              type: string
+              format: uri
+            retryable:
+              type: boolean
+              description: If true, safe to retry with exponential backoff
+            request_id:
+              type: string
+
+  responses:
+    ValidationError:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: validation_required_param
+              message: "The `amount` field is required."
+              param: amount
+              retryable: false
+              request_id: req_01HX...
+    AuthError:
+      description: Authentication or authorisation failure
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFoundError:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimitError:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

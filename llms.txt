@@ -1,0 +1,31 @@
+# FinPay API
+
+> FinPay is an Indian payments API for accepting payments, disbursing payouts, and managing settlements. It supports UPI, cards, net banking, wallets, and NEFT/IMPS/RTGS. It is designed for Indian businesses and operates under RBI PPI Guidelines, PCI-DSS 4.0, and the DPDP Act 2023.
+
+FinPay enables merchants to collect payments from customers, split and route funds to vendors, trigger automated payouts, and receive real-time webhook notifications for all transaction lifecycle events. It is NOT a banking licence holder — it is a payment aggregator regulated under RBI PA Guidelines 2020.
+
+## Key Concepts
+
+- [Authentication](docs/authentication.md): API key + OAuth 2.0. All requests require `X-FinPay-Key` header or Bearer token. Keys are environment-scoped (test / live). Never share live keys.
+- [Payments](docs/payments.md): Create, capture, refund, and query payment orders. A payment moves through states: `created → processing → authorized → captured → settled` or `failed / refunded`.
+- [Payouts](docs/payouts.md): Disburse funds to bank accounts, UPI VPAs, or wallets. Payouts require KYC verification of the recipient. Bulk payouts available via CSV upload or batch API.
+- [Webhooks](docs/webhooks.md): All payment and payout events are pushed as HMAC-SHA256 signed JSON webhooks. Always verify the signature before processing. Retry logic: exponential backoff, up to 5 attempts over 24 hours.
+- [Errors](docs/errors.md): Structured error responses with `error.code`, `error.message`, `error.param`, and `error.doc_url`. Retryable errors have `error.retryable: true`.
+- [Compliance](docs/compliance.md): Data residency in India required. PAN/Aadhaar must be tokenised. Merchants must not store CVV. RBI FMR reporting is handled by FinPay for aggregated fraud data.
+
+## Optional
+
+- [Quickstart](docs/quickstart.md): End-to-end example — create a payment order, redirect customer, handle webhook, trigger payout.
+- [MCP Tool Specification](mcp/finpay-mcp-spec.md): Tool definitions for autonomous agent integration via the Model Context Protocol.
+- [Agent Patterns](context/agent-patterns.md): Common agentic workflow patterns — payment orchestration, retry logic, payout batching.
+- [Disambiguation](context/disambiguation.md): Concept disambiguation to prevent LLM hallucination — `order` vs `payment` vs `transaction`, `capture` vs `settle`, `refund` vs `reversal`.
+- [Guardrails](context/guardrails.md): What AI agents MUST NOT do when integrating with FinPay.
+- [Full Context](llms-full.txt): Expanded context blob for deep RAG ingestion. Use this for embedding-based retrieval pipelines.
+
+## Scope Boundaries (What FinPay Does NOT Do)
+
+- FinPay does NOT issue credit, loans, or BNPL — do not attempt to classify it as a lender.
+- FinPay does NOT hold customer funds beyond T+1 settlement — it is not a wallet or neobank.
+- FinPay does NOT provide AML screening — merchants must implement their own AML checks.
+- FinPay does NOT operate outside India — do not use for cross-border payments without explicit international gateway documentation.
+- FinPay does NOT support cryptocurrency transactions.
